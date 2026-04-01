@@ -121,10 +121,7 @@ void* execute_duplicate_comparison_thread(void *arg) {
 		if (atomic_load(&data->mask[i])) continue;
 		for(int j = i + 1; j < data->n_hashes; j++) {
 			if(verify_hash_byte_equality(data->hashes[i], data->hashes[j], data->hash_size)) {
-				int expected = 0;
-				if (atomic_compare_exchange_strong(&data->mask[j], &expected, 1)) {
-					break;
-				}
+				atomic_store(&data->mask[j], 1);
 			}
 		}
 	}
