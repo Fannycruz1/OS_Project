@@ -39,6 +39,13 @@ typedef struct {
 	int end_idx;
 } compare_thread_data_t;
 
+int verify_hash_byte_equality(unsigned char *a, unsigned char *b, int n) {
+	for(int i=0; i < n; i++)
+		if(a[i] != b[i])
+			return 0;
+	return 1;
+}
+
 work_queue_t* initialize_threaded_work_queue(int capacity) {
 	work_queue_t *q = malloc(sizeof(work_queue_t));
 	q->queue = malloc(capacity * sizeof(work_item_t));
@@ -123,14 +130,6 @@ void* execute_duplicate_comparison_thread(void *arg) {
 	}
 	return NULL;
 }
-
-int verify_hash_byte_equality(unsigned char *a, unsigned char *b, int n) {
-	for(int i=0; i < n; i++)
-		if(a[i] != b[i])
-			return 0;
-	return 1;
-}
-
 
 
 void dedupe(char *filename, int chunk_size, char *output) {
