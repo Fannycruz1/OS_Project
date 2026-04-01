@@ -10,6 +10,8 @@
 
 #define MAX_THREADS 10
 
+_Atomic int shared_current_i = 0;
+
 typedef struct {
 	char *data;
 	int index;
@@ -116,12 +118,19 @@ void* process_hash_calculation_thread(void *arg) {
 
 void* execute_duplicate_comparison_thread(void *arg) {
 	compare_thread_data_t *data = (compare_thread_data_t *)arg;
-
-	for(int i = data->start_idx; i < data->end_idx && i < data->n_hashes; i++) {
+	while (1) {
+		// grab the next available chunk index and safely increment the global counter
+		int i = atomic_fetch_add(&shared_current_i, 1);
+		
+		// if the index exceeds the number of hashes, all chunks are processed
+		if (i >= data->n_hashes) {
+			break;
+		}
 		if (atomic_load(&data->mask[i])) continue;
 		for(int j = i + 1; j < data->n_hashes; j++) {
 			if(verify_hash_byte_equality(data->hashes[i], data->hashes[j], data->hash_size)) {
-				atomic_store(&data->mask[j], 1);
+				// we found a duplicate, mark it with a 1 (removed the break statement to find ALL duplicates)
+				atomic_store(&data->mask[j], 1); 
 			}
 		}
 	}
