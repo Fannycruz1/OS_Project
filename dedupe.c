@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdatomic.h>
 
 #include "hash_functions.h"
 
