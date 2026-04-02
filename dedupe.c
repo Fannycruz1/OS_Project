@@ -3,257 +3,198 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <pthread.h>
-#include <semaphore.h>
+#include <stdint.h>
+#include <unistd.h>
 #include <stdatomic.h>
 
 #include "hash_functions.h"
 
-#define MAX_THREADS 10
+#define MAX_WORKERS 12
 
-_Atomic int shared_current_i = 0;
+/* functions */
+
+static int next_pow2(int x) {
+    int p = 1;
+    while (p < x) p <<= 1;
+    return p;
+}
+
+
+
+typedef struct { 
+    uint64_t prefix; 
+    unsigned char *digest; 
+} Bucket;
+
+static void build_mask(unsigned char **digests, int n, int dsz, int *mask) {
+    if (n == 0) return;
+
+    int cap = next_pow2(n * 2);
+    int mod = cap - 1;
+
+    Bucket *table = calloc(cap, sizeof(Bucket));
+    assert(table != NULL);
+
+    for (int i = 0; i < n; i++) {
+        uint64_t pfx;
+        memcpy(&pfx, digests[i], sizeof pfx);
+
+        int slot = (int)(pfx & (uint64_t)mod);
+
+        for (;;) {
+            if (!table[slot].digest) {
+                table[slot].prefix = pfx;
+                table[slot].digest = digests[i];
+                break;
+            }
+
+            if (table[slot].prefix == pfx &&
+                !memcmp(table[slot].digest, digests[i], dsz)) {
+                mask[i] = 1;
+                break;
+            }
+
+            slot = (slot + 1) & mod;
+        }
+    }
+
+    free(table);
+}
+
+/*  hashing */
 
 typedef struct {
-	char *data;
-	int index;
-	unsigned char *hash;
-} work_item_t;
+    unsigned char  *file_data;
+    unsigned char **digest_ptrs;
+    unsigned char  *digest_pool;
+    int             digest_size;
+    int             chunk_size;
+    int             begin;
+    int             end;
+} DigestRange;
 
-typedef struct {
-	work_item_t *queue;
-	int front, rear, size, capacity;
-	pthread_mutex_t mutex;
-	pthread_cond_t not_empty, not_full;
-	int done;
-} work_queue_t;
+static void *digest_worker(void *arg) {
+    DigestRange *r = (DigestRange *)arg;
 
-typedef struct {
-	work_queue_t *queue;
-	unsigned char **hashes; // added this 
-	int chunk_size;
-} hash_thread_data_t;
+    int cs = r->chunk_size;
+    int ds = r->digest_size;
 
-typedef struct {
-	unsigned char **hashes;
-	_Atomic int *mask;
-	int hash_size;
-	int n_hashes;
-	int start_idx;
-	int end_idx;
-} compare_thread_data_t;
+    for (int i = r->begin; i < r->end; i++) {
+        unsigned char *h = calculate_sha512(
+            r->file_data + (size_t)i * cs, cs);
 
-int verify_hash_byte_equality(unsigned char *a, unsigned char *b, int n) {
-	for(int i=0; i < n; i++)
-		if(a[i] != b[i])
-			return 0;
-	return 1;
+        unsigned char *slot = r->digest_pool + (size_t)i * ds;
+
+        memcpy(slot, h, ds);
+        free(h);
+
+        r->digest_ptrs[i] = slot;
+    }
+
+    return NULL;
 }
 
-work_queue_t* initialize_threaded_work_queue(int capacity) {
-	work_queue_t *q = malloc(sizeof(work_queue_t));
-	q->queue = malloc(capacity * sizeof(work_item_t));
-	q->front = q->rear = q->size = 0;
-	q->capacity = capacity;
-	q->done = 0;
-	pthread_mutex_init(&q->mutex, NULL);
-	pthread_cond_init(&q->not_empty, NULL);
-	pthread_cond_init(&q->not_full, NULL);
-	return q;
-}
-
-void cleanup_threaded_work_queue(work_queue_t *q) {
-	pthread_mutex_destroy(&q->mutex);
-	pthread_cond_destroy(&q->not_empty);
-	pthread_cond_destroy(&q->not_full);
-	free(q->queue);
-	free(q);
-}
-
-void add_work_item_to_queue(work_queue_t *q, work_item_t item) {
-	pthread_mutex_lock(&q->mutex);
-	while(q->size == q->capacity) {
-		pthread_cond_wait(&q->not_full, &q->mutex);
-	}
-	q->queue[q->rear] = item;
-	q->rear = (q->rear + 1) % q->capacity;
-	q->size++;
-	pthread_cond_signal(&q->not_empty);
-	pthread_mutex_unlock(&q->mutex);
-}
-
-int retrieve_work_item_from_queue(work_queue_t *q, work_item_t *item) {
-	pthread_mutex_lock(&q->mutex);
-	while(q->size == 0 && !q->done) {
-		pthread_cond_wait(&q->not_empty, &q->mutex);
-	}
-	if(q->size == 0 && q->done) {
-		pthread_mutex_unlock(&q->mutex);
-		return 0;
-	}
-	*item = q->queue[q->front];
-	q->front = (q->front + 1) % q->capacity;
-	q->size--;
-	pthread_cond_signal(&q->not_full);
-	pthread_mutex_unlock(&q->mutex);
-	return 1;
-}
-
-void signal_work_queue_completion(work_queue_t *q) {
-	pthread_mutex_lock(&q->mutex);
-	q->done = 1;
-	pthread_cond_broadcast(&q->not_empty);
-	pthread_mutex_unlock(&q->mutex);
-}
-
-void* process_hash_calculation_thread(void *arg) {
-	hash_thread_data_t *data = (hash_thread_data_t *)arg;
-	work_item_t item;
-
-	while(retrieve_work_item_from_queue(data->queue, &item)) {
-		data->hashes[item.index] = calculate_sha512((unsigned char *)item.data, data->chunk_size);
-		free(item.data);
-		// mutex lock is not needed here since each thread writes to a unique index in the hashes array
-	}
-	return NULL;
-}
-
-void* execute_duplicate_comparison_thread(void *arg) {
-	compare_thread_data_t *data = (compare_thread_data_t *)arg;
-	while (1) {
-		// grab the next available chunk index and safely increment the global counter
-		int i = atomic_fetch_add(&shared_current_i, 1);
-		
-		// if the index exceeds the number of hashes, all chunks are processed
-		if (i >= data->n_hashes) {
-			break;
-		}
-		if (atomic_load(&data->mask[i])) continue;
-		for(int j = i + 1; j < data->n_hashes; j++) {
-			if(verify_hash_byte_equality(data->hashes[i], data->hashes[j], data->hash_size)) {
-				// we found a duplicate, mark it with a 1 (removed the break statement to find ALL duplicates)
-				atomic_store(&data->mask[j], 1); 
-			}
-		}
-	}
-	return NULL;
-}
 
 
 void dedupe(char *filename, int chunk_size, char *output) {
-	FILE *fp;
-	char *buffer = (char *) malloc(chunk_size*sizeof(char));
-	unsigned char **hashes = NULL;
-	int hash_size = size_sha512(), n_hashes = 0;
+    FILE *fp = fopen(filename, "r");
+    assert(fp != NULL);
 
-	fp = fopen(filename, "r");
-	assert(fp != NULL);
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    rewind(fp);
 
-	while(fread(buffer, sizeof(char), chunk_size, fp) == chunk_size) {
-		hashes = (unsigned char **) realloc(hashes, (n_hashes+1)*sizeof(unsigned char *));
-		hashes[n_hashes] = NULL;
-		n_hashes++;
-	}
-	fclose(fp);
+    int n = 0;
+    if (fsize >= chunk_size) {
+        n = (int)(fsize / chunk_size);
+    }
 
-	if(n_hashes == 0) {
-		fp = fopen(output, "w");
-		fprintf(fp, "\n");
-		fclose(fp);
-		free(buffer);
-		free(hashes);
-		return;
-	}
+    unsigned char *raw = NULL;
 
-	work_queue_t *queue = initialize_threaded_work_queue(n_hashes * 2);
-	hash_thread_data_t hash_data = {queue, hashes, chunk_size};
+    if (n > 0) {
+        raw = malloc((size_t)n * chunk_size);
+        assert(raw != NULL);
 
-	int num_threads = (n_hashes < MAX_THREADS) ? n_hashes : MAX_THREADS;
-	pthread_t hash_threads[MAX_THREADS];
+        n = (int)fread(raw, chunk_size, n, fp);
+    }
 
-	for(int i = 0; i < num_threads; i++) {
-		pthread_create(&hash_threads[i], NULL, process_hash_calculation_thread, &hash_data);
-	}
+    fclose(fp);
 
-	fp = fopen(filename, "r");
-	if (!fp) {
-		signal_work_queue_completion(queue);
-		for(int j = 0; j < num_threads; j++)
-			pthread_join(hash_threads[j], NULL);
-		cleanup_threaded_work_queue(queue);
-		free(buffer);
-		free(hashes);
-		exit(1);
-	}
-	for(int i = 0; i < n_hashes; i++) {
-		char *chunk_data = malloc(chunk_size);
-		if (!chunk_data) {
-			signal_work_queue_completion(queue);
-			for(int j = 0; j < num_threads; j++)
-				pthread_join(hash_threads[j], NULL);
-			cleanup_threaded_work_queue(queue);
-			fclose(fp);
-			free(buffer);
-			free(hashes);
-			exit(1);
-		}
-		if (fread(chunk_data, sizeof(char), chunk_size, fp) != (size_t)chunk_size) {
-			free(chunk_data);
-			signal_work_queue_completion(queue);
-			for(int j = 0; j < num_threads; j++)
-				pthread_join(hash_threads[j], NULL);
-			cleanup_threaded_work_queue(queue);
-			fclose(fp);
-			free(buffer);
-			free(hashes);
-			exit(1);
-		}
-		work_item_t item = {chunk_data, i, NULL};
-		add_work_item_to_queue(queue, item);
-	}
-	fclose(fp);
+    int dsz = (int)size_sha512();
 
-	signal_work_queue_completion(queue);
+    unsigned char **digests = NULL;
+    unsigned char  *dpool   = NULL;
 
-	for(int i = 0; i < num_threads; i++) {
-		pthread_join(hash_threads[i], NULL);
-	}
+    if (n > 0) {
+        digests = malloc((size_t)n * sizeof(unsigned char *));
+        dpool   = malloc((size_t)n * dsz);
 
-	
+        assert(digests != NULL);
+        assert(dpool   != NULL);
+    }
 
-	cleanup_threaded_work_queue(queue);
+    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpus < 1) ncpus = 1;
 
-	_Atomic int *mask = calloc(n_hashes, sizeof(_Atomic int));
+    int nw = (int)ncpus;
 
-	pthread_t compare_threads[MAX_THREADS];
-	compare_thread_data_t compare_data[MAX_THREADS];
-	int threads_used = (n_hashes < MAX_THREADS) ? n_hashes : MAX_THREADS;
-	int chunk_per_thread = n_hashes / threads_used;
-	int remainder = n_hashes % threads_used;
+    if (nw > MAX_WORKERS) {
+        nw = MAX_WORKERS;
+    }
 
-	for(int i = 0; i < threads_used; i++) {
-		compare_data[i].hashes = hashes;
-		compare_data[i].mask = mask;
-		compare_data[i].hash_size = hash_size;
-		compare_data[i].n_hashes = n_hashes;
-		compare_data[i].start_idx = i * chunk_per_thread + (i < remainder ? i : remainder);
-		compare_data[i].end_idx = compare_data[i].start_idx + chunk_per_thread + (i < remainder ? 1 : 0);
-		pthread_create(&compare_threads[i], NULL, execute_duplicate_comparison_thread, &compare_data[i]);
-	}
+    if (nw > n) {
+        nw = n;
+    }
 
-	for(int i = 0; i < threads_used; i++) {
-		pthread_join(compare_threads[i], NULL);
-	}
+    DigestRange ranges[MAX_WORKERS];
+    pthread_t   tids[MAX_WORKERS];
 
-	fp = fopen(output, "w");
-	assert(fp != NULL);
-	for(int i=0; i < n_hashes; i++)
-		fprintf(fp, "%d", mask[i]);
-	fprintf(fp, "\n");
-	fclose(fp);
+    for (int t = 0; t < nw; t++) {
+        ranges[t].file_data   = raw;
+        ranges[t].digest_ptrs = digests;
+        ranges[t].digest_pool = dpool;
+        ranges[t].digest_size = dsz;
+        ranges[t].chunk_size  = chunk_size;
 
-	free(buffer);
-	for(int i=0; i < n_hashes; i++)
-		free(hashes[i]);
-	free(hashes);
-	free(mask);
+        ranges[t].begin = (int)((long)t * n / nw);
+        ranges[t].end   = (int)((long)(t + 1) * n / nw);
+
+        pthread_create(&tids[t], NULL, digest_worker, &ranges[t]);
+    }
+
+    for (int t = 0; t < nw; t++) {
+        pthread_join(tids[t], NULL);
+    }
+
+    free(raw);
+
+    int *mask = calloc(n > 0 ? n : 1, sizeof(int));
+    assert(mask != NULL);
+
+    build_mask(digests, n, dsz, mask);
+
+    fp = fopen(output, "w");
+    assert(fp != NULL);
+
+    if (n > 0) {
+        char *outbuf = malloc(n + 1);
+        assert(outbuf != NULL);
+
+        for (int i = 0; i < n; i++) {
+            outbuf[i] = '0' + mask[i];
+        }
+
+        outbuf[n] = '\n';
+
+        fwrite(outbuf, 1, n + 1, fp);
+        free(outbuf);
+    } else {
+        fputc('\n', fp);
+    }
+
+    fclose(fp);
+
+    free(mask);
+    free(dpool);
+    free(digests);
 }
-
