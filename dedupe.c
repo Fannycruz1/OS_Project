@@ -1,220 +1,223 @@
+/*
+ * dedupe.c  —  parallel implementation
+ *
+ * Optimizations over the reference serial version:
+ *
+ *  1. Read entire file in one fread() instead of chunk-by-chunk.
+ *
+ *  2. Hash all chunks in parallel using NUM_THREADS worker threads.
+ *     Work is statically partitioned (no mutex hot-path during hashing).
+ *     Each thread holds its own local copy of the chunk data because
+ *     calculate_sha512() sorts the buffer in-place via qsort().
+ *
+ *  3. Duplicate detection via open-addressing hash map -> O(n) instead of
+ *     the reference's O(n^2) nested loop. This matters enormously on large
+ *     files with small chunk sizes (e.g., 100 MB / 4 B = 25 M chunks).
+ *
+ *  4. Output written in one fwrite() call instead of n_chunks fprintf() calls.
+ *
+ * Thread budget: NUM_THREADS worker threads + 1 main thread = 12 total,
+ * which is exactly the allowed maximum.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <pthread.h>
-#include <semaphore.h>
-#include <stdatomic.h>
+#include <sys/stat.h>
 
 #include "hash_functions.h"
 
-#define MAX_THREADS 10
-#define QUEUE_CAPACITY 128  
+/* tuneable */
+#define NUM_THREADS 11   /* +1 main = 12 total (hard cap per spec) */
 
-
-_Atomic int shared_current_i = 0;
-
-typedef struct {
-	char *data;
-	int index;
-	unsigned char *hash;
-} work_item_t;
+/* ---- parallel hashing -------------------------------------------------- */
 
 typedef struct {
-	work_item_t *queue;
-	int front, rear, size, capacity;
-	pthread_mutex_t mutex;
-	pthread_cond_t not_empty, not_full;
-	int done;
-} work_queue_t;
+    const char    *file_data;   /* read-only pointer into the file buffer */
+    int            chunk_size;
+    int            start;       /* first chunk index owned by this thread */
+    int            end;         /* one past last chunk index (exclusive)  */
+    unsigned char **hashes;     /* shared output array; each slot is independent */
+} HashArg;
 
-typedef struct {
-	work_queue_t *queue;
-	unsigned char **hashes;
-	int chunk_size;
-} hash_thread_data_t;
+static void *hash_worker(void *arg)
+{
+    const HashArg *a = (const HashArg *)arg;
 
-typedef struct {
-	unsigned char **hashes;
-	_Atomic int *mask;
-	int hash_size;
-	int n_hashes;
-} compare_thread_data_t;
+    /*
+     * Local buffer: calculate_sha512() sorts its input in-place (qsort),
+     * so we must not pass a pointer into the shared file buffer.
+     * One local copy per thread, reused across all chunks this thread owns.
+     */
+    unsigned char *local_buf = (unsigned char *)malloc(a->chunk_size);
+    assert(local_buf);
 
+    for (int i = a->start; i < a->end; i++) {
+        memcpy(local_buf, a->file_data + (long)i * a->chunk_size, a->chunk_size);
+        a->hashes[i] = calculate_sha512(local_buf, a->chunk_size);
+    }
 
-int verify_hash_byte_equality(unsigned char *a, unsigned char *b, int n) {
-	return memcmp(a, b, n) == 0;
+    free(local_buf);
+    return NULL;
 }
 
-work_queue_t* initialize_threaded_work_queue(int capacity) {
-	work_queue_t *q = malloc(sizeof(work_queue_t));
-	q->queue = malloc(capacity * sizeof(work_item_t));
-	q->front = q->rear = q->size = 0;
-	q->capacity = capacity;
-	q->done = 0;
-	pthread_mutex_init(&q->mutex, NULL);
-	pthread_cond_init(&q->not_empty, NULL);
-	pthread_cond_init(&q->not_full, NULL);
-	return q;
+/* ---- open-addressing hash map ------------------------------------------
+ *
+ * Key   : pointer to a SHA-512 hash (64 bytes), compared with memcmp.
+ * Value : implicit -- presence means "seen at least once".
+ *
+ * Initial slot = first 4 bytes of SHA-512 output (uniformly distributed).
+ * Load factor kept <= 50% (capacity = next power-of-2 >= 2*n_chunks).
+ * ------------------------------------------------------------------------ */
+
+typedef struct { unsigned char *hash; } Slot;
+
+static int ht_insert_or_find(Slot *ht, unsigned int cap_mask,
+                              unsigned char *hash, int hash_size)
+{
+    unsigned int s = ((unsigned int)hash[0] << 24)
+                   | ((unsigned int)hash[1] << 16)
+                   | ((unsigned int)hash[2] <<  8)
+                   |  (unsigned int)hash[3];
+    s &= cap_mask;
+
+    while (ht[s].hash != NULL) {
+        if (memcmp(ht[s].hash, hash, hash_size) == 0)
+            return 1;            /* duplicate */
+        s = (s + 1) & cap_mask; /* linear probe */
+    }
+    ht[s].hash = hash;
+    return 0;                    /* newly inserted */
 }
 
-void cleanup_threaded_work_queue(work_queue_t *q) {
-	pthread_mutex_destroy(&q->mutex);
-	pthread_cond_destroy(&q->not_empty);
-	pthread_cond_destroy(&q->not_full);
-	free(q->queue);
-	free(q);
+/* keep compare_hashes() in case anything links against it */
+int compare_hashes(unsigned char *a, unsigned char *b, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (a[i] != b[i]) return 0;
+    return 1;
 }
 
-void add_work_item_to_queue(work_queue_t *q, work_item_t item) {
-	pthread_mutex_lock(&q->mutex);
-	while(q->size == q->capacity) {
-		pthread_cond_wait(&q->not_full, &q->mutex);
-	}
-	q->queue[q->rear] = item;
-	q->rear = (q->rear + 1) % q->capacity;
-	q->size++;
-	pthread_cond_signal(&q->not_empty);
-	pthread_mutex_unlock(&q->mutex);
-}
+/* ---- main entry point -------------------------------------------------- */
 
-int retrieve_work_item_from_queue(work_queue_t *q, work_item_t *item) {
-	pthread_mutex_lock(&q->mutex);
-	while(q->size == 0 && !q->done) {
-		pthread_cond_wait(&q->not_empty, &q->mutex);
-	}
-	if(q->size == 0 && q->done) {
-		pthread_mutex_unlock(&q->mutex);
-		return 0;
-	}
-	*item = q->queue[q->front];
-	q->front = (q->front + 1) % q->capacity;
-	q->size--;
-	pthread_cond_signal(&q->not_full);
-	pthread_mutex_unlock(&q->mutex);
-	return 1;
-}
+void dedupe(char *filename, int chunk_size, char *output)
+{
+    /* 1. Read entire file into one contiguous buffer */
+    FILE *fp = fopen(filename, "r");
+    assert(fp != NULL);
 
-void signal_work_queue_completion(work_queue_t *q) {
-	pthread_mutex_lock(&q->mutex);
-	q->done = 1;
-	pthread_cond_broadcast(&q->not_empty);
-	pthread_mutex_unlock(&q->mutex);
-}
+    struct stat st;
+    fstat(fileno(fp), &st);
+    long file_size = st.st_size;
 
-void* process_hash_calculation_thread(void *arg) {
-	hash_thread_data_t *data = (hash_thread_data_t *)arg;
-	work_item_t item;
+    /*
+     * The reference ignores any trailing partial chunk
+     * (fread returns < chunk_size -> loop ends).
+     * Equivalent: integer division.
+     */
+    int n_chunks = (int)(file_size / chunk_size);
 
-	while(retrieve_work_item_from_queue(data->queue, &item)) {
-		data->hashes[item.index] = calculate_sha512((unsigned char *)item.data, data->chunk_size);
-		free(item.data);
-	}
-	return NULL;
-}
+    char *file_data = NULL;
+    if (n_chunks > 0) {
+        long needed = (long)n_chunks * chunk_size;
+        file_data = (char *)malloc(needed);
+        assert(file_data);
+        size_t rd = fread(file_data, 1, needed, fp);
+        (void)rd;
+    }
+    fclose(fp);
 
-void* execute_duplicate_comparison_thread(void *arg) {
-	compare_thread_data_t *data = (compare_thread_data_t *)arg;
-	while (1) {
-		int i = atomic_fetch_add(&shared_current_i, 1);
-		if (i >= data->n_hashes) break;
+    /* Edge case: no complete chunks -> output is just a newline (matches ref). */
+    if (n_chunks == 0) {
+        fp = fopen(output, "w");
+        assert(fp);
+        fprintf(fp, "\n");
+        fclose(fp);
+        free(file_data);
+        return;
+    }
 
-		if (atomic_load(&data->mask[i])) continue;
+    /* 2. Allocate the hash pointer array */
+    int hash_size = size_sha512();
+    unsigned char **hashes =
+        (unsigned char **)malloc(n_chunks * sizeof(unsigned char *));
+    assert(hashes);
 
-		for(int j = i + 1; j < data->n_hashes; j++) {
-			if(verify_hash_byte_equality(data->hashes[i], data->hashes[j], data->hash_size)) {
-				atomic_store(&data->mask[j], 1);
-			}
-		}
-	}
-	return NULL;
-}
+    /* 3. Hash all chunks in parallel
+     *
+     * Static partitioning: thread t owns chunks [start_t, end_t).
+     * No mutexes needed -- each slot in `hashes` is written by exactly one thread.
+     */
+    int nthreads = (NUM_THREADS < n_chunks) ? NUM_THREADS : n_chunks;
 
+    pthread_t tids[NUM_THREADS];
+    HashArg   args[NUM_THREADS];
 
-void dedupe(char *filename, int chunk_size, char *output) {
-	FILE *fp;
-	int hash_size = size_sha512();
+    int base  = n_chunks / nthreads;
+    int extra = n_chunks % nthreads;  /* first `extra` threads get one extra chunk */
+    int cur   = 0;
 
-	fp = fopen(filename, "r");
-	assert(fp != NULL);
-	fseek(fp, 0, SEEK_END);
-	long file_size = ftell(fp);
-	fclose(fp);
+    for (int t = 0; t < nthreads; t++) {
+        int count          = base + (t < extra ? 1 : 0);
+        args[t].file_data  = file_data;
+        args[t].chunk_size = chunk_size;
+        args[t].start      = cur;
+        args[t].end        = cur + count;
+        args[t].hashes     = hashes;
+        cur += count;
+        pthread_create(&tids[t], NULL, hash_worker, &args[t]);
+    }
+    for (int t = 0; t < nthreads; t++)
+        pthread_join(tids[t], NULL);
 
-	int n_hashes = (int)(file_size / chunk_size);
+    /* file_data no longer needed -- free before allocating the hash table */
+    free(file_data);
 
-	if(n_hashes == 0) {
-		fp = fopen(output, "w");
-		fprintf(fp, "\n");
-		fclose(fp);
-		return;
-	}
+    /* 4. Find duplicates via O(n) hash map
+     *
+     * For each chunk i (in order), check whether its hash was already seen.
+     *   Yes -> mask[i] = 1  (duplicate of some earlier chunk j < i)
+     *   No  -> mask[i] = 0, and record this hash as first occurrence.
+     *
+     * This matches the reference semantics exactly:
+     *   mask[j] = 1  iff  exists i < j  s.t.  hashes[i] == hashes[j]
+     *
+     * Capacity: next power-of-2 >= 2*n_chunks -> load factor <= 50%.
+     */
+    unsigned int cap = 1;
+    while (cap < (unsigned int)(2 * n_chunks)) cap <<= 1;
+    unsigned int cap_mask = cap - 1;
 
-	unsigned char **hashes = malloc(n_hashes * sizeof(unsigned char *));
-	assert(hashes != NULL);
-	for(int i = 0; i < n_hashes; i++) hashes[i] = NULL;
+    Slot *ht = (Slot *)calloc(cap, sizeof(Slot));
+    assert(ht);
 
-	work_queue_t *queue = initialize_threaded_work_queue(QUEUE_CAPACITY);
-	hash_thread_data_t hash_data = {queue, hashes, chunk_size};
+    /* Reuse hashes[i] pointer as the table key -- no extra copy needed. */
+    char *mask = (char *)malloc(n_chunks + 2); /* '0'/'1' chars + '\n' + NUL */
+    assert(mask);
 
-	int num_threads = (n_hashes < MAX_THREADS) ? n_hashes : MAX_THREADS;
-	pthread_t hash_threads[MAX_THREADS];
+    for (int i = 0; i < n_chunks; i++)
+        mask[i] = '0' + ht_insert_or_find(ht, cap_mask, hashes[i], hash_size);
 
-	for(int i = 0; i < num_threads; i++) {
-		pthread_create(&hash_threads[i], NULL, process_hash_calculation_thread, &hash_data);
-	}
+    free(ht);
 
-	fp = fopen(filename, "r");
-	assert(fp != NULL);
-	for(int i = 0; i < n_hashes; i++) {
-		char *chunk_data = malloc(chunk_size);
-		assert(chunk_data != NULL);
-		if (fread(chunk_data, sizeof(char), chunk_size, fp) != (size_t)chunk_size) {
-			free(chunk_data);
-			break;
-		}
-		work_item_t item = {chunk_data, i, NULL};
-		add_work_item_to_queue(queue, item);
-	}
-	fclose(fp);
+    /* 5. Write output in one shot
+     *
+     * n_chunks individual fprintf() calls are slow for large n.
+     * Build the result in-memory and fwrite it all at once.
+     */
+    mask[n_chunks]     = '\n';
+    mask[n_chunks + 1] = '\0';
 
-	signal_work_queue_completion(queue);
+    fp = fopen(output, "w");
+    assert(fp != NULL);
+    fwrite(mask, 1, n_chunks + 1, fp);
+    fclose(fp);
 
-	for(int i = 0; i < num_threads; i++) {
-		pthread_join(hash_threads[i], NULL);
-	}
-
-	cleanup_threaded_work_queue(queue);
-
-	atomic_store(&shared_current_i, 0);
-
-	_Atomic int *mask = calloc(n_hashes, sizeof(_Atomic int));
-
-	pthread_t compare_threads[MAX_THREADS];
-	compare_thread_data_t compare_data[MAX_THREADS];
-	int threads_used = (n_hashes < MAX_THREADS) ? n_hashes : MAX_THREADS;
-
-	for(int i = 0; i < threads_used; i++) {
-		compare_data[i].hashes = hashes;
-		compare_data[i].mask = mask;
-		compare_data[i].hash_size = hash_size;
-		compare_data[i].n_hashes = n_hashes;
-		pthread_create(&compare_threads[i], NULL, execute_duplicate_comparison_thread, &compare_data[i]);
-	}
-
-	for(int i = 0; i < threads_used; i++) {
-		pthread_join(compare_threads[i], NULL);
-	}
-
-	fp = fopen(output, "w");
-	assert(fp != NULL);
-	for(int i=0; i < n_hashes; i++)
-		fprintf(fp, "%d", mask[i]);
-	fprintf(fp, "\n");
-	fclose(fp);
-
-	for(int i=0; i < n_hashes; i++)
-		free(hashes[i]);
-	free(hashes);
-	free(mask);
+    /* 6. Release memory */
+    free(mask);
+    for (int i = 0; i < n_chunks; i++)
+        free(hashes[i]);
+    free(hashes);
 }
